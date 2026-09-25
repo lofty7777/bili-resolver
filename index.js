@@ -1,3 +1,102 @@
+import { connect } from 'cloudflare:sockets';
+
+async function bypassFetch(url, options = {}) {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname;
+    const isHttps = urlObj.protocol === 'https:';
+    const port = isHttps ? 443 : 80;
+    const path = urlObj.pathname + urlObj.search;
+
+    const headers = new Headers(options.headers || {});
+    headers.set('Host', hostname);
+    if (!headers.has('User-Agent')) headers.set('User-Agent', UA);
+    if (!headers.has('Accept')) headers.set('Accept', 'application/json, text/plain, */*');
+    headers.set('Accept-Encoding', 'identity');
+    headers.set('Connection', 'close');
+
+    const method = (options.method || 'GET').toUpperCase();
+    let body = '';
+    if (options.body && method !== 'GET' && method !== 'HEAD') {
+        body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+        headers.set('Content-Length', String(new TextEncoder().encode(body).length));
+    }
+
+    let reqString = `${method} ${path} HTTP/1.1\r\n`;
+    for (const [key, value] of headers.entries()) {
+        reqString += `${key}: ${value}\r\n`;
+    }
+    reqString += '\r\n';
+    if (body) reqString += body;
+
+    const socket = connect({ hostname, port }, { secureTransport: isHttps ? 'on' : 'off', allowHalfOpen: false });
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+
+    try {
+        await writer.write(new TextEncoder().encode(reqString));
+        await writer.close();
+
+        const chunks = [];
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+        }
+
+        const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+        const responseBytes = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+            responseBytes.set(chunk, offset);
+            offset += chunk.length;
+        }
+
+        const responseText = new TextDecoder('utf-8', { fatal: false }).decode(responseBytes);
+        const headerEndIndex = responseText.indexOf('\r\n\r\n');
+        if (headerEndIndex === -1) throw new Error('Invalid HTTP response');
+
+        const headerText = responseText.substring(0, headerEndIndex);
+        let bodyText = responseText.substring(headerEndIndex + 4);
+
+        const headerLines = headerText.split('\r\n');
+        const statusMatch = headerLines[0].match(/^HTTP\/\d\.\d (\d+)/);
+        const statusCode = statusMatch ? parseInt(statusMatch[1]) : 200;
+
+        const responseHeaders = new Headers();
+        for (let i = 1; i < headerLines.length; i++) {
+            const colonIndex = headerLines[i].indexOf(':');
+            if (colonIndex > 0) {
+                responseHeaders.append(
+                    headerLines[i].substring(0, colonIndex).trim(),
+                    headerLines[i].substring(colonIndex + 1).trim()
+                );
+            }
+        }
+
+        const transferEncoding = responseHeaders.get('transfer-encoding');
+        if (transferEncoding && transferEncoding.toLowerCase().includes('chunked')) {
+            let decoded = '';
+            let i = 0;
+            while (i < bodyText.length) {
+                const lineEnd = bodyText.indexOf('\r\n', i);
+                if (lineEnd === -1) break;
+                const size = parseInt(bodyText.substring(i, lineEnd).trim(), 16);
+                if (isNaN(size) || size === 0) break;
+                i = lineEnd + 2;
+                decoded += bodyText.substring(i, i + size);
+                i += size + 2;
+            }
+            bodyText = decoded;
+        }
+
+        return new Response(bodyText, { status: statusCode, headers: responseHeaders });
+    } finally {
+        try { writer.releaseLock(); } catch (e) {}
+        try { reader.releaseLock(); } catch (e) {}
+        try { socket.close(); } catch (e) {}
+    }
+}
+
 /**
  * Bilibili Resolver & Proxy Worker
  * 
@@ -19,22 +118,25 @@ let WORKER_ENV = {};
 function proxiedFetch(originalUrl, options = {}) {
     let finalUrl = originalUrl;
     const isBiliApi = typeof originalUrl === 'string' && (originalUrl.includes('api.bilibili.com') || originalUrl.includes('api.live.bilibili.com'));
-    
-    // Vercel 代理地址，从环境变量读取
+
     const proxyBase = WORKER_ENV.VERCEL_PROXY;
     if (proxyBase && isBiliApi) {
         finalUrl = proxyBase + encodeURIComponent(originalUrl);
+        const finalOptions = { ...options };
+        const token = WORKER_ENV.PROXY_TOKEN;
+        if (token) {
+            finalOptions.headers = new Headers(options.headers || {});
+            finalOptions.headers.set('x-proxy-token', token);
+        }
+        return fetch(finalUrl, finalOptions);
     }
-    
-    const finalOptions = { ...options };
-    // 给 Vercel 代理的请求统一带上 Token（从环境变量读取）
-    const token = WORKER_ENV.PROXY_TOKEN;
-    if (token && isBiliApi) {
-        finalOptions.headers = new Headers(options.headers || {});
-        finalOptions.headers.set('x-proxy-token', token);
+
+    // 关键修改：B站 API 请求走 bypassFetch（Socket API），绕过 cf-* 标头注入
+    if (isBiliApi) {
+        return bypassFetch(finalUrl, options);
     }
-    
-    return fetch(finalUrl, finalOptions);
+
+    return fetch(finalUrl, options);
 }
 
 const ERROR_MAP = {
@@ -931,3 +1033,4 @@ export default {
 // Existing functions are exported as-is so tests can drive them directly with a
 // mocked fetch. The `export default` Worker handler above is unchanged.
 export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson };
+

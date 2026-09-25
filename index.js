@@ -29,6 +29,13 @@ async function bypassFetch(url, options = {}) {
     if (body) reqString += body;
 
     const socket = connect({ hostname, port }, { secureTransport: isHttps ? 'on' : 'off', allowHalfOpen: false });
+
+    try {
+        await socket.opened;
+    } catch (e) {
+        throw new Error(`Socket connect failed: ${e.message}`);
+    }
+
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
 
@@ -51,13 +58,23 @@ async function bypassFetch(url, options = {}) {
             offset += chunk.length;
         }
 
-        const responseText = new TextDecoder('utf-8', { fatal: false }).decode(responseBytes);
-        const headerEndIndex = responseText.indexOf('\r\n\r\n');
-        if (headerEndIndex === -1) throw new Error('Invalid HTTP response');
+        // 在字节层面查找 \r\n\r\n（HTTP 头结束标志）
+        let headerEndIndex = -1;
+        for (let i = 0; i < responseBytes.length - 3; i++) {
+            if (responseBytes[i] === 13 && responseBytes[i+1] === 10 && responseBytes[i+2] === 13 && responseBytes[i+3] === 10) {
+                headerEndIndex = i;
+                break;
+            }
+        }
 
-        const headerText = responseText.substring(0, headerEndIndex);
-        let bodyText = responseText.substring(headerEndIndex + 4);
+        if (headerEndIndex === -1) {
+            throw new Error(`Invalid HTTP response: header end not found (length=${responseBytes.length})`);
+        }
 
+        const headerBytes = responseBytes.slice(0, headerEndIndex);
+        let bodyBytes = responseBytes.slice(headerEndIndex + 4);
+
+        const headerText = new TextDecoder('utf-8', { fatal: false }).decode(headerBytes);
         const headerLines = headerText.split('\r\n');
         const statusMatch = headerLines[0].match(/^HTTP\/\d\.\d (\d+)/);
         const statusCode = statusMatch ? parseInt(statusMatch[1]) : 200;
@@ -73,21 +90,50 @@ async function bypassFetch(url, options = {}) {
             }
         }
 
+        // 处理 chunked 编码
         const transferEncoding = responseHeaders.get('transfer-encoding');
         if (transferEncoding && transferEncoding.toLowerCase().includes('chunked')) {
-            let decoded = '';
+            const decodedChunks = [];
             let i = 0;
-            while (i < bodyText.length) {
-                const lineEnd = bodyText.indexOf('\r\n', i);
+            while (i < bodyBytes.length) {
+                let lineEnd = -1;
+                for (let j = i; j < bodyBytes.length - 1; j++) {
+                    if (bodyBytes[j] === 13 && bodyBytes[j+1] === 10) {
+                        lineEnd = j;
+                        break;
+                    }
+                }
                 if (lineEnd === -1) break;
-                const size = parseInt(bodyText.substring(i, lineEnd).trim(), 16);
+
+                const sizeStr = new TextDecoder().decode(bodyBytes.slice(i, lineEnd));
+                const size = parseInt(sizeStr.trim(), 16);
                 if (isNaN(size) || size === 0) break;
-                i = lineEnd + 2;
-                decoded += bodyText.substring(i, i + size);
-                i += size + 2;
+
+                const chunkStart = lineEnd + 2;
+                const chunkEnd = chunkStart + size;
+                decodedChunks.push(bodyBytes.slice(chunkStart, chunkEnd));
+                i = chunkEnd + 2;
             }
-            bodyText = decoded;
+            const totalLen = decodedChunks.reduce((sum, c) => sum + c.length, 0);
+            const merged = new Uint8Array(totalLen);
+            let off = 0;
+            for (const c of decodedChunks) {
+                merged.set(c, off);
+                off += c.length;
+            }
+            bodyBytes = merged;
         }
+
+        // 处理 gzip 编码
+        const contentEncoding = responseHeaders.get('content-encoding');
+        if (contentEncoding && contentEncoding.toLowerCase().includes('gzip')) {
+            const ds = new DecompressionStream('gzip');
+            const stream = new Blob([bodyBytes]).stream().pipeThrough(ds);
+            const decompressed = await new Response(stream).arrayBuffer();
+            bodyBytes = new Uint8Array(decompressed);
+        }
+
+        const bodyText = new TextDecoder('utf-8', { fatal: false }).decode(bodyBytes);
 
         return new Response(bodyText, { status: statusCode, headers: responseHeaders });
     } finally {
@@ -105,7 +151,7 @@ async function bypassFetch(url, options = {}) {
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20260609-028'; // 每次 push 时更新此版本号
+const VERSION = '20260609-029'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -145,11 +191,8 @@ const ERROR_MAP = {
 };
 
 // --- 反爬错误 ---
-// 统一的中文反爬提示，供视频解析链路在识别风控时返回给前端。
 const ANTI_CRAWL_MSG = 'B 站风控拦截，请稍后重试';
 
-// 哨兵错误类型：上层可通过 `instanceof AntiCrawlError` 或 `err.name === 'AntiCrawlError'`
-// 识别反爬失败，而无需依赖脆弱的字符串匹配。
 class AntiCrawlError extends Error {
     constructor(message = ANTI_CRAWL_MSG) {
         super(message);
@@ -158,30 +201,22 @@ class AntiCrawlError extends Error {
 }
 
 // --- 安全 JSON 抓取助手 ---
-// 集中完成「状态码检查 → Content-Type / body 嗅探 → JSON 解析 → code:-352 识别」，
-// 识别到反爬时抛出带哨兵标记的 AntiCrawlError（中文消息），绝不让原始的
-// `Unexpected token` / `is not valid JSON` 解析错误泄漏到上层。
-// 注意：非 -352 的业务码（如 -404）不在此处理，原样返回交由调用点既有 ERROR_MAP 逻辑（保证 Preservation）。
 async function fetchBiliJson(url, options) {
     const res = await proxiedFetch(url, options);
 
-    // 2) body 只消费一次，统一按文本读取后再解析。
     const text = await res.text();
 
-    // 1) 非 2xx 视为反爬 / 异常。优先检查是否是 Vercel 代理本身的报错
     if (!res.ok) {
         if (res.status === 401 || text.includes('Unauthorized')) throw new Error('Vercel 代理鉴权失败：请检查 Cloudflare 上的 PROXY_TOKEN 是否与 Vercel 中的代码一致');
         if (res.status === 404 || text.includes('NOT_FOUND')) throw new Error('Vercel 代理地址失效：请检查 VERCEL_PROXY 变量结尾是否带了 /api/proxy?url=');
         throw new AntiCrawlError();
     }
 
-    // 3) Content-Type 非 JSON，或 body 以 '<' 开头（HTML / DOCTYPE 风控页）→ 反爬。
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json') || text.trim().startsWith('<')) {
         throw new AntiCrawlError();
     }
 
-    // 4) JSON 解析失败（避免原始 SyntaxError 泄漏）→ 反爬。
     let json;
     try {
         json = JSON.parse(text);
@@ -189,10 +224,8 @@ async function fetchBiliJson(url, options) {
         throw new AntiCrawlError();
     }
 
-    // 5) 风控校验失败码 → 反爬。
     if (json.code === -352) throw new AntiCrawlError();
 
-    // 6) 其余（含其它业务码）原样返回。
     return json;
 }
 
@@ -205,12 +238,8 @@ async function getBuvid() {
     } catch (e) { return "FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc"; }
 }
 
-// --- 反爬 Cookie 采集 ---
-// 同 getBuvid() 的硬编码回退 buvid3，确保 finger/spi 失败时 Cookie 至少含 buvid3。
 const FALLBACK_BUVID3 = "FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc";
 
-// 自包含的 HMAC-SHA256 hex 计算（走原生 WebCrypto crypto.subtle），用于生成
-// bili_ticket 所需的 hexsign。key = 'XgwSnGZ1p'，message = 'ts' + ts。
 async function hmacSha256Hex(key, message) {
     const enc = new TextEncoder();
     const cryptoKey = await crypto.subtle.importKey(
@@ -220,25 +249,17 @@ async function hmacSha256Hex(key, message) {
     return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 采集降低风控概率的反爬 Cookie：
-//   1) finger/spi -> buvid3 (b_3) / buvid4 (b_4)；失败则回退到硬编码 buvid3 常量。
-//   2) 可选叠加 bili_ticket（HMAC-SHA256 + GenWebTicket），整段 try/catch 降级，
-//      任何失败都不阻断主流程，退化为仅 buvid3/buvid4。
-//   3) 拼接 Cookie 字符串（缺失项跳过）；buvid3 始终存在。
-// getBuvid() 的签名与回退常量保持不变（直播链路继续使用）。
 async function getAntiCrawlCookie() {
     let buvid3 = FALLBACK_BUVID3;
     let buvid4 = null;
 
-    // 1) finger/spi -> b_3 / b_4
     try {
         const res = await proxiedFetch("https://api.bilibili.com/x/frontend/finger/spi", { headers: { "User-Agent": UA } });
         const json = await res.json();
         if (json.data?.b_3) buvid3 = json.data.b_3;
         if (json.data?.b_4) buvid4 = json.data.b_4;
-    } catch (e) { /* 保留 fallback buvid3 */ }
+    } catch (e) { }
 
-    // 2) 可选 bili_ticket（任何失败都优雅降级）
     let ticket = null;
     try {
         const ts = Math.floor(Date.now() / 1000);
@@ -247,28 +268,21 @@ async function getAntiCrawlCookie() {
         const res = await proxiedFetch(ticketUrl, { method: 'POST', headers: { "User-Agent": UA } });
         const json = await res.json();
         if (json.data?.ticket) ticket = json.data.ticket;
-    } catch (e) { /* 降级为仅 buvid3 / buvid4 */ }
+    } catch (e) { }
 
-    // 3) 拼接 Cookie（缺失项跳过；buvid3 始终存在）
     const parts = [`buvid3=${buvid3}`];
     if (buvid4) parts.push(`buvid4=${buvid4}`);
     if (ticket) parts.push(`bili_ticket=${ticket}`);
     return parts.join('; ');
 }
 
-// --- WBI 签名 ---
 const mixinKeyEncTab = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
 const getMixinKey = (orig) => mixinKeyEncTab.map(n => orig[n]).join('').slice(0, 32);
 async function md5(text) {
     const hashBuffer = await crypto.subtle.digest('MD5', new TextEncoder().encode(text));
     return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
-// 从 nav 接口取 wbi_img 并派生 mixin_key。
-// 走 fetchBiliJson（注入 User-Agent / Referer / Cookie），识别到反爬时抛 AntiCrawlError，
-// 而非对 HTML 风控页调 .json() 抛出原始 `Unexpected token`。
-// 对合法 nav 数据，mixin_key 的派生（getMixinKey over img_url/sub_url basenames）与改造前完全一致。
-// 拆出此函数是为了让单次解析内只取一次 nav：getPlayUrlWithFallback 的 fallback 循环
-// 可复用缓存的 mixin_key，而不必每个清晰度都重新请求 nav。
+
 async function getMixinKeyFromNav(cookie) {
     const json = await fetchBiliJson("https://api.bilibili.com/x/web-interface/nav", {
         headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
@@ -277,11 +291,6 @@ async function getMixinKeyFromNav(cookie) {
     return getMixinKey(img_url.split('/').pop().split('.')[0] + sub_url.split('/').pop().split('.')[0]);
 }
 
-// WBI 签名。
-// - 若传入预先计算好的 `mixinKey`，直接使用（不再请求 nav）；
-// - 否则通过 getMixinKeyFromNav(cookie) 取一次（cookie 可为 undefined，向后兼容 signWbi(params)）。
-// 对合法 nav 数据，签名输出（query + w_rid）与改造前逐字节一致：mixin_key 派生、wts、
-// 参数排序、md5(query + mixin_key) 的逻辑均未改变，只有「取 nav 的方式」与「nav 缓存拆分」发生变化。
 async function signWbi(params, cookie, mixinKey) {
     const mixin_key = mixinKey !== undefined ? mixinKey : await getMixinKeyFromNav(cookie);
     const curr_params = { ...params, wts: Math.floor(Date.now() / 1000) };
@@ -289,56 +298,33 @@ async function signWbi(params, cookie, mixinKey) {
     return query + `&w_rid=${await md5(query + mixin_key)}`;
 }
 
-// --- APP / TV 端取流签名 ---
-// 数据中心 IP 上 web 端 playurl 极易被风控（-352）。APP / TV 端使用 appkey + sign
-// 签名的接口走另一套风控策略，对未登录游客的容忍度通常更高，故作为 web 线路的备用。
-// appkey / appsec 来自公开的逆向资料（bilibili-API-collect: docs/misc/sign/APPKey.md）。
 const APP_KEYS = {
-    // iOS 视频取流专用
     ios: { appkey: 'YvirImLGlLANCLvM', appsec: 'JNlZNgfNGKZEpaDTkCdPQVXntXhuiJEM', platform: 'ios', ua: 'Bilibili/8.0.0 (bbcallen@gmail.com)' },
-    // 云视听小电视 TV 版
     tv: { appkey: '4409e2ce8ffd12b8', appsec: '59b43e04ad6965f34319062b478f83dd', platform: 'android', ua: 'Bilibili Freedoooooom/MOD' }
 };
 
-// APP API 签名：加 appkey → 按 key 排序 → urlencode 序列化 → 拼 appsec → md5(32 位小写) → sign。
-// 算法见 bilibili-API-collect: docs/misc/sign/APP.md。
 async function appSign(params, appkey, appsec) {
     const all = { ...params, appkey };
     const query = Object.keys(all).sort().map(k => `${k}=${encodeURIComponent(all[k])}`).join('&');
     return query + `&sign=${await md5(query + appsec)}`;
 }
 
-// --- 视频解析 (多线路取流) ---
-// 数据中心 IP 上 web 端 playurl 极易被风控（-352 / HTML 风控页）。为在纯 serverless
-// 前提下尽量提高成功率，对每个清晰度依次尝试多条独立线路（APP iOS 取流 → TV → web），
-// 任一线路成功即返回；只有当所有线路在所有清晰度上都失败时才报错。
-//
-// - APP / TV 线路用 appkey+sign 签名，走另一套风控策略，对未登录游客容忍度通常更高；
-//   web 线路保留 wbi 签名并加 try_look=1 + platform=html5（未登录可拉 720P/1080P、无 referer 鉴权）。
-// - nav（mixin_key）仅 web 线路需要，且整个过程只取一次：调用方未传入则在进入循环前计算一次。
-//   若 nav 本身就是反爬响应，web 线路会被跳过，但 APP/TV 线路不依赖 nav，仍可继续尝试。
-// - 反爬识别（fetchBiliJson 抛 AntiCrawlError）被视为「该线路失败」记入 lastError 并尝试下一条，
-//   而非立即整体放弃——因为别的线路可能没被风控。全部线路皆失败时，若失败原因全是反爬则抛
-//   AntiCrawlError（前端显示中文风控提示），否则抛普通业务错误。
-// - Preservation：成功返回 { url, quality } 的结构不变；web 线路的业务失败回退语义保持。
 async function getPlayUrlWithFallback(bvid, cid, targetQn, cookie, mixinKey) {
     const qualities = [targetQn, 80, 64, 32].filter((v, i, a) => a.indexOf(v) === i && v <= targetQn);
 
-    // 仅 web 线路需要 mixin_key；取 nav 失败（含反爬）不应阻断 APP/TV 线路。
     let mixin_key = mixinKey;
     let navAvailable = true;
     if (mixin_key === undefined) {
         try {
             mixin_key = await getMixinKeyFromNav(cookie);
         } catch (e) {
-            navAvailable = false; // nav 取不到（可能被风控），web 线路跳过，仍尝试 APP/TV
+            navAvailable = false;
         }
     }
 
     let lastError = null;
     let sawAntiCrawl = false;
 
-    // 单条线路：成功返回 { url, quality }；失败抛错（由调用处归类）。
     const tryAppLine = async (qn, conf) => {
         const params = { bvid, cid: String(cid), qn: String(qn), fnval: '1', fnver: '0', fourk: '1', platform: conf.platform, ts: String(Math.floor(Date.now() / 1000)) };
         const signed = await appSign(params, conf.appkey, conf.appsec);
@@ -378,21 +364,14 @@ async function getPlayUrlWithFallback(bvid, cid, targetQn, cookie, mixinKey) {
                 } else {
                     lastError = e.message;
                 }
-                // 该线路失败，尝试下一条线路 / 下一档清晰度。
             }
         }
     }
 
-    // 全部线路皆失败：若出现过反爬且无其它业务错误，报中文风控；否则报业务错误。
     if (sawAntiCrawl && !lastError) throw new AntiCrawlError();
     throw new Error(lastError || (sawAntiCrawl ? ANTI_CRAWL_MSG : "视频解析失败"));
 }
 
-// 单次解析内只采集一次反爬 Cookie（finger/spi 仅请求一次），并将 Cookie 注入
-// view / nav / playurl 三个请求。view 走 fetchBiliJson（识别反爬抛 AntiCrawlError，
-// 不再对 HTML 风控页调 .json() 泄漏 `Unexpected token`）。
-// 顺序保留：先 view，view 业务码检查通过后再取一次 nav（mixin_key），最后 playurl。
-// 这样 view 的反爬/业务错误会在任何 nav 请求之前短路，且 nav 在单次解析内只取一次。
 async function resolveVideo(bvid, qn, host) {
     const cookie = await getAntiCrawlCookie();
 
@@ -402,19 +381,14 @@ async function resolveVideo(bvid, qn, host) {
     if (vData.code !== 0) throw new Error(ERROR_MAP[vData.code] || vData.message);
 
     const { cid, title, pic, owner } = vData.data;
-    // 不在此预取 nav：nav 在数据中心 IP 上可能被风控，预取失败会阻断 APP/TV 取流线路。
-    // 将 nav（mixin_key）的获取交给 getPlayUrlWithFallback 内部按需、容错地处理。
     const videoStream = await getPlayUrlWithFallback(bvid, cid, qn || 116, cookie);
 
-    // playableUrl 走 /proxy 中转：代理会附加正确的 Referer，使浏览器 Range 请求（进度条拖动）正常工作
-    // 已修复：代理底层通过抛弃僵尸连接（传递 AbortSignal），彻底解决拖动卡死问题
     const playableUrl = `${host}/proxy?url=${encodeURIComponent(videoStream.url)}&name=${encodeURIComponent(title)}`;
     const downloadUrl = `${host}/proxy?url=${encodeURIComponent(videoStream.url)}&name=${encodeURIComponent(title)}&dl=1`;
 
     return { title, pic, bvid, author: owner.name, playableUrl, downloadUrl, quality: videoStream.quality, isLive: false };
 }
 
-// --- 直播解析 (v4.1) ---
 async function resolveLive(roomId, host) {
     const infoRes = await proxiedFetch(`https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`, {
         headers: { 'User-Agent': UA, 'Referer': LIVE_REFERER }
@@ -433,7 +407,6 @@ async function resolveLive(roomId, host) {
         'Cookie': `buvid3=${buvid}`
     });
 
-    // Legacy API (稳定)
     const fetchStreamLegacy = async () => {
         const api = `https://api.live.bilibili.com/room/v1/Room/playUrl?cid=${realRoomId}&platform=h5&quality=3`;
         try {
@@ -448,7 +421,6 @@ async function resolveLive(roomId, host) {
         return null;
     };
 
-    // V2 API 备用
     const fetchStreamV2 = async () => {
         const api = `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=${realRoomId}&protocol=0,1&format=0,1,2&codec=0,1&platform=h5&qn=150`;
         try {
@@ -475,9 +447,6 @@ async function resolveLive(roomId, host) {
     if (!result) result = await fetchStreamV2();
     if (!result) throw new Error("获取直播流失败");
 
-    // 直播流使用 Vercel + CF 混合代理：
-    // m3u8 播放列表通过 Vercel 代理获取（绕过 CF IP 被 ov 节点拦截），ts 切片直连 CDN
-    // 配合 <meta name="referrer" content="no-referrer"> 测试空 Referer
     const playableUrl = `${host}/proxy?url=${encodeURIComponent(result.url)}&live=1&m3u8_direct=1`;
     const isHLS = result.url.includes('.m3u8');
     const formatStr = `${isHLS ? 'HLS' : 'FLV'} (${result.nodeType})`;
@@ -495,7 +464,6 @@ async function resolveLive(roomId, host) {
     };
 }
 
-// --- 双模式 UI ---
 const UI = (host) => `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -528,7 +496,6 @@ const UI = (host) => `
             <p class="text-xs font-bold text-slate-500 tracking-[0.4em] uppercase">v3.2</p>
         </div>
 
-        <!-- 模式切换 -->
         <div class="flex justify-center mb-4">
             <div class="glass rounded-full p-1 flex gap-1">
                 <button id="modeVideo" onclick="setMode('video')" class="mode-btn active px-4 py-2 rounded-full text-sm font-bold">📺 视频</button>
@@ -537,7 +504,6 @@ const UI = (host) => `
         </div>
 
         <div class="glass rounded-3xl p-6 space-y-4">
-            <!-- 视频模式 -->
             <div id="videoPanel" class="space-y-3">
                 <input type="text" id="videoInput" placeholder="粘贴 BV号 / 视频链接..." 
                     class="w-full bg-slate-900/60 border border-slate-700/50 rounded-xl px-4 py-4 text-sm focus:ring-2 focus:ring-blue-500 outline-none text-center">
@@ -564,7 +530,6 @@ const UI = (host) => `
                 </div>
             </div>
 
-            <!-- 直播模式 -->
             <div id="livePanel" class="hidden space-y-3">
                 <input type="text" id="liveInput" placeholder="输入直播房间号..." 
                     class="w-full bg-slate-900/60 border border-slate-700/50 rounded-xl px-4 py-4 text-sm focus:ring-2 focus:ring-pink-500 outline-none text-center">
@@ -574,10 +539,8 @@ const UI = (host) => `
                 <p class="text-[10px] text-slate-500 text-center">⚠️ OV 节点可能无法播放，需多尝试几次</p>
             </div>
 
-            <!-- 加载 -->
             <div id="loader" class="hidden py-8 text-center"><div class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div></div>
 
-            <!-- 结果 -->
             <div id="result" class="hidden space-y-4 pt-4 border-t border-white/5">
                 <video id="inlineVideo" class="hidden w-full rounded-xl bg-black" controls playsinline></video>
                 <div class="flex gap-4 items-start">
@@ -602,7 +565,6 @@ const UI = (host) => `
             </div>
         </div>
 
-        <!-- 历史记录 (仅视频) -->
         <div id="historyArea" class="hidden mt-6 glass rounded-3xl p-5">
             <h4 class="text-xs font-bold text-slate-500 uppercase mb-3 flex justify-between"><span>最近解析</span><span onclick="clearHistory()" class="cursor-pointer hover:text-white">清除</span></h4>
             <div id="historyList" class="space-y-2"></div>
@@ -787,7 +749,6 @@ const UI = (host) => `
 </html>
 `;
 
-// --- Proxy ---
 async function handleProxy(request, url, host) {
     const target = url.searchParams.get('url');
     const name = url.searchParams.get('name');
@@ -810,14 +771,12 @@ async function handleProxy(request, url, host) {
         'Origin': isLive ? 'https://live.bilibili.com' : 'https://www.bilibili.com'
     });
     
-    // 只转发 Range 请求头。绝对不能转发 If-Range 或 If-Match，因为 CF 会修改 ETag，导致 B 站 CDN 校验失败从而忽略 Range 返回 200 全量视频
     const forwardHeaders = ['Range'];
     for (const h of forwardHeaders) {
         if (request.headers.has(h)) newHeaders.set(h, request.headers.get(h));
     }
 
     try {
-        // Accept-Encoding: identity 避免 CF 压缩导致串流卡顿
         newHeaders.set('Accept-Encoding', 'identity');
         let response;
         for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -851,26 +810,22 @@ async function handleProxy(request, url, host) {
             return new Response(m3u8Content, { status: 200, headers: responseHeaders });
         }
 
-        // 剔除 ETag 和 Last-Modified，避免浏览器在使用强缓存时发送错误的 If-Range
         const headersToCopy = ['Content-Type', 'Content-Length', 'Accept-Ranges', 'Content-Range', 'Cache-Control'];
         for (const h of headersToCopy) {
             if (response.headers.has(h)) responseHeaders.set(h, response.headers.get(h));
         }
         
-        // 必须 Expose 这些 Headers，否则前端浏览器或 VRChat 的播放器拿不到断点续传信息
         responseHeaders.set('Access-Control-Expose-Headers', headersToCopy.join(', '));
         if (name && isDownload) {
             responseHeaders.set("Content-Disposition", `attachment; filename="${encodeURIComponent(name)}.mp4"`);
         }
 
-        // 关键修复：HTTP 304 Not Modified 和 204 No Content 绝对不能携带 body（哪怕是 null 在某些 V8 版本也会报错）
         if (response.status === 204 || response.status === 304) {
             return new Response(undefined, { status: response.status, headers: responseHeaders });
         }
 
         return new Response(response.body, { status: response.status, headers: responseHeaders });
     } catch (e) {
-        // AbortError 是用户拖动进度条时浏览器主动取消的正常行为，不要返回 502 口吹浏览器
         if (e.name === 'AbortError') return new Response(null, { status: 499 });
         return new Response('Proxy Error: ' + e.message, { status: 502 });
     }
@@ -887,7 +842,6 @@ export default {
             return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': '*' } });
         }
 
-        // /live/房间号 直链入口
         const liveMatch = path.match(/^\/live\/(\d+)$/);
         if (liveMatch) {
             try {
@@ -901,15 +855,12 @@ export default {
         if (path === '/proxy') return handleProxy(request, url, host);
         if (path === '/' || path === '') return new Response(UI(host), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
 
-        // 版本探针：用于确认 CF Worker 是否已部署最新代码
         if (path === '/v') return new Response(JSON.stringify({
             version: VERSION,
             VERCEL_PROXY: WORKER_ENV.VERCEL_PROXY ? '✅ 已配置' : '❌ 未配置',
             PROXY_TOKEN: WORKER_ENV.PROXY_TOKEN ? '✅ 已配置' : '❌ 未配置',
         }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
 
-        // 全局文案/链接直连入口：支持在域名后直接粘贴 B 站分享文案或链接（包含 BV 或 b23.tv 短链）
-        // 例如：https://bili.yamadaryo.me/【xxx】https://www.bilibili.com/video/BV1...
         const decodedPath = decodeURIComponent(path);
         const bvMatch = decodedPath.match(/(BV[a-zA-Z0-9]{10})/i);
         const b23Match = decodedPath.match(/b23\.tv\/([a-zA-Z0-9]+)/i);
@@ -957,13 +908,11 @@ export default {
             }
         }
 
-        // 视频 API
         if (path === '/api/video') {
             let text = url.searchParams.get('text');
             const qn = parseInt(url.searchParams.get('qn')) || 116;
             if (!text) return new Response(JSON.stringify({ status: 'error', message: 'Missing text' }), { status: 400 });
 
-            // 尝试解析 b23.tv 短链
             const b23Match = text.match(/b23\.tv\/([a-zA-Z0-9]+)/);
             if (b23Match) {
                 try {
@@ -972,7 +921,6 @@ export default {
                         text = res.headers.get('location') || text;
                     }
                 } catch (e) {
-                    // 忽略短链解析失败，交由后续的 BV 号匹配来判断
                 }
             }
 
@@ -985,7 +933,6 @@ export default {
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }
                 });
             } catch (e) {
-                // 反爬异常统一映射为中文提示；其它异常保留原 message（如 ERROR_MAP 业务码错误）。
                 const message = (e instanceof AntiCrawlError || e.name === 'AntiCrawlError') ? ANTI_CRAWL_MSG : e.message;
                 return new Response(JSON.stringify({ status: 'error', message }), {
                     status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -993,12 +940,10 @@ export default {
             }
         }
 
-        // 直播 API
         if (path === '/api/live') {
             let room = url.searchParams.get('room');
             if (!room) return new Response(JSON.stringify({ status: 'error', message: 'Missing room' }), { status: 400 });
 
-            // 尝试解析 b23.tv 短链
             const b23Match = room.match(/b23\.tv\/([a-zA-Z0-9]+)/);
             if (b23Match) {
                 try {
@@ -1009,7 +954,6 @@ export default {
                 } catch (e) {}
             }
 
-            // 提取房间号：优先匹配 live.bilibili.com/数字，否则直接匹配纯数字
             const roomId = room.match(/live\.bilibili\.com\/(\d+)/)?.[1] || room.match(/(?<![a-zA-Z])(\d+)(?![a-zA-Z])/)?.[1] || room.match(/(\d+)/)?.[1];
             if (!roomId) return new Response(JSON.stringify({ status: 'error', message: '无效的房间号' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
@@ -1029,8 +973,4 @@ export default {
     }
 }
 
-// --- Named exports for testing (non-behavioral) ---
-// Existing functions are exported as-is so tests can drive them directly with a
-// mocked fetch. The `export default` Worker handler above is unchanged.
 export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson };
-
